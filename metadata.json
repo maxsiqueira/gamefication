@@ -2,5 +2,7 @@
   "name": "KubeCommander - Gamified Kubernetes Monitoring & Ops Simulator",
   "description": "Real-time Kubernetes monitoring tool with gamified dashboards, cluster health alerts, failure simulators, badges, and team efficiency leaderboards to master container orchestration.",
   "requestFramePermissions": [],
-  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
 }

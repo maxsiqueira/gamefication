@@ -25,8 +25,21 @@ import {
   CHAOS_SCENARIOS, 
   INITIAL_USER_PROGRESS 
 } from './utils/k8sSimulation';
+import { 
+  CorporateUser, 
+  getStoredCorporateUser, 
+  saveCorporateUser, 
+  clearCorporateUser 
+} from './utils/corporateAuth';
+import { 
+  TeamSide, 
+  Guild, 
+  BattleEvent, 
+  INITIAL_GUILDS 
+} from './types/guild';
 import { sounds } from './utils/audio';
 
+import { CorporateAuthGate } from './components/CorporateAuthGate';
 import { TitleScreen } from './components/TitleScreen';
 import { GameHUD } from './components/GameHUD';
 import { ClusterTopology } from './components/ClusterTopology';
@@ -39,8 +52,41 @@ import { DeployWorkloadModal } from './components/DeployWorkloadModal';
 import { LeaderboardModal } from './components/LeaderboardModal';
 import { BadgesModal } from './components/BadgesModal';
 import { AcademyModal } from './components/AcademyModal';
+import { GuildWarModal } from './components/GuildWarModal';
 
 export default function App() {
+  // Corporate Authentication State (Restricted to @ionsistemas.com.br)
+  const [corporateUser, setCorporateUser] = React.useState<CorporateUser | null>(() => {
+    return getStoredCorporateUser();
+  });
+  const [currentTeam, setCurrentTeam] = React.useState<TeamSide>('blue');
+  const [guilds, setGuilds] = React.useState<Guild[]>(INITIAL_GUILDS);
+  const [currentGuildId, setCurrentGuildId] = React.useState<string>(INITIAL_GUILDS[0].id);
+
+  // Live Battle Events Feed between Blue Team & Red Team
+  const [battleEvents, setBattleEvents] = React.useState<BattleEvent[]>([
+    {
+      id: 'event-init-1',
+      timestamp: Date.now() - 60000,
+      type: 'defense',
+      actorName: 'Max Sena',
+      actorTeam: 'blue',
+      description: 'Mitigou Memory Leak em analytics-worker via kubectl patch (+512Mi)',
+      points: 120,
+      target: 'analytics-worker',
+    },
+    {
+      id: 'event-init-2',
+      timestamp: Date.now() - 120000,
+      type: 'attack',
+      actorName: 'Rafael Costa',
+      actorTeam: 'red',
+      description: 'Injetou Cyber Storm DDoS (5.000 RPS) em payment-gateway',
+      points: 160,
+      target: 'payment-gateway',
+    },
+  ]);
+
   // Game Shell State
   const [gameState, setGameState] = React.useState<'TITLE' | 'PLAYING' | 'PAUSED'>('TITLE');
   const [activeGameMode, setActiveGameMode] = React.useState<'incident' | 'academy' | 'sandbox'>('incident');
@@ -85,6 +131,7 @@ export default function App() {
   const [leaderboardModalOpen, setLeaderboardModalOpen] = React.useState<boolean>(false);
   const [badgesModalOpen, setBadgesModalOpen] = React.useState<boolean>(false);
   const [academyModalOpen, setAcademyModalOpen] = React.useState<boolean>(false);
+  const [guildWarModalOpen, setGuildWarModalOpen] = React.useState<boolean>(false);
   const [inspectPod, setInspectPod] = React.useState<Pod | null>(null);
   const [inspectNode, setInspectNode] = React.useState<Node | null>(null);
 
@@ -99,6 +146,8 @@ export default function App() {
     activeAlertsCount: 1,
     uptimeSeconds: 14200,
   });
+
+  const activeGuild = guilds.find(g => g.id === currentGuildId) || guilds[0];
 
   // Award XP and handle level-ups
   const awardXp = React.useCallback((amount: number) => {
@@ -163,7 +212,6 @@ export default function App() {
     const handleKeyDown = (e: KeyboardEvent) => {
       if (gameState !== 'PLAYING') return;
 
-      // Don't trigger shortcuts if user is typing in an input
       if (
         document.activeElement?.tagName === 'INPUT' ||
         document.activeElement?.tagName === 'TEXTAREA'
@@ -177,7 +225,6 @@ export default function App() {
         setTerminalOpen(prev => !prev);
       } else if (e.key === 'Escape') {
         e.preventDefault();
-        // Close modals if open, else toggle terminal
         if (inspectPod) setInspectPod(null);
         else if (inspectNode) setInspectNode(null);
         else if (alertsModalOpen) setAlertsModalOpen(false);
@@ -186,6 +233,7 @@ export default function App() {
         else if (leaderboardModalOpen) setLeaderboardModalOpen(false);
         else if (badgesModalOpen) setBadgesModalOpen(false);
         else if (academyModalOpen) setAcademyModalOpen(false);
+        else if (guildWarModalOpen) setGuildWarModalOpen(false);
         else if (terminalOpen) setTerminalOpen(false);
       } else if (e.key === '1') {
         setSelectedNamespace('all');
@@ -194,7 +242,7 @@ export default function App() {
       } else if (e.key === '3') {
         setDeployModalOpen(true);
       } else if (e.key === '4') {
-        setAcademyModalOpen(true);
+        setGuildWarModalOpen(true);
       }
     };
 
@@ -210,6 +258,7 @@ export default function App() {
     leaderboardModalOpen,
     badgesModalOpen,
     academyModalOpen,
+    guildWarModalOpen,
     terminalOpen,
   ]);
 
@@ -226,9 +275,8 @@ export default function App() {
           let updatedRestarts = pod.restarts;
           let updatedLogs = [...pod.logs];
 
-          // If pod has a simulated memory leak
           if (pod.hasMemoryLeak && pod.status === 'Running') {
-            updatedUsage += 45; // rapid climb
+            updatedUsage += 45;
             if (updatedUsage >= pod.memLimit) {
               updatedStatus = 'OOMKilled';
               updatedRestarts += 1;
@@ -236,7 +284,6 @@ export default function App() {
               sounds.playAlert();
               unlockBadge('badge-oom-tamer');
 
-              // Create OOM Alert
               setAlerts(prevAlerts => [
                 {
                   id: `oom-${Date.now()}`,
@@ -255,7 +302,6 @@ export default function App() {
             }
           }
 
-          // Liveness probe check for failing pods
           if (!pod.livenessProbe.healthy && pod.status === 'Running') {
             updatedStatus = 'CrashLoopBackOff';
             updatedRestarts += 1;
@@ -277,7 +323,6 @@ export default function App() {
       if (activeScenario) {
         setScenarioTimeLeft(prevTime => {
           if (prevTime <= 1) {
-            // Scenario timed out
             sounds.playAlert();
             setActiveScenario(null);
             return 0;
@@ -285,9 +330,7 @@ export default function App() {
           return prevTime - 1;
         });
 
-        // Scenario Success Condition Checks
         if (activeScenario.id === 'scenario-oom') {
-          // Check if analytics-worker memory limit was increased >= 1024
           const analyticsDeploy = deployments.find(d => d.name === 'analytics-worker');
           if (analyticsDeploy && analyticsDeploy.memLimit >= 1024) {
             awardXp(activeScenario.xpReward);
@@ -295,7 +338,6 @@ export default function App() {
             setActiveScenario(null);
           }
         } else if (activeScenario.id === 'scenario-traffic') {
-          // Check if payment-gateway scaled >= 6 replicas
           const paymentDeploy = deployments.find(d => d.name === 'payment-gateway');
           if (paymentDeploy && paymentDeploy.replicas >= 6) {
             awardXp(activeScenario.xpReward);
@@ -303,7 +345,6 @@ export default function App() {
             setActiveScenario(null);
           }
         } else if (activeScenario.id === 'scenario-node') {
-          // Check if node-prod-pool-01 is drained
           const targetNode = nodes.find(n => n.name === 'node-prod-pool-01');
           if (targetNode && targetNode.cordoned) {
             awardXp(activeScenario.xpReward);
@@ -347,13 +388,295 @@ export default function App() {
     return () => clearInterval(interval);
   }, [gameState, activeScenario, deployments, nodes, pods, alerts, awardXp, unlockBadge]);
 
+  // Handle Authentication from Corporate Gate
+  const handleAuthenticated = (user: CorporateUser, team: TeamSide, guildId: string) => {
+    setCorporateUser(user);
+    setCurrentTeam(team);
+    setCurrentGuildId(guildId);
+    awardXp(200);
+
+    // Add user to the guild member list if not present
+    setGuilds(prevGuilds =>
+      prevGuilds.map(g => {
+        if (g.id === guildId) {
+          const exists = g.members.some(m => m.email === user.email);
+          if (exists) {
+            return {
+              ...g,
+              members: g.members.map(m =>
+                m.email === user.email ? { ...m, team, online: true } : m
+              ),
+            };
+          }
+          const newMember = {
+            id: `member-${Date.now()}`,
+            name: user.name,
+            email: user.email,
+            avatar: team === 'blue' ? '👨‍💻' : '⚡',
+            role: team === 'blue' ? 'Senior SRE' as const : 'Chaos Specialist' as const,
+            team,
+            online: true,
+            score: 200,
+            badgesCount: 1,
+            lastAction: 'Ingressou na Arena ION Sistemas',
+          };
+          return { ...g, members: [newMember, ...g.members] };
+        }
+        return g;
+      })
+    );
+  };
+
+  const handleLogout = () => {
+    clearCorporateUser();
+    setCorporateUser(null);
+    setGameState('TITLE');
+  };
+
+  // RED TEAM ATTACK HANDLER (Chaos Injector)
+  const handleRedTeamAttack = (attackType: 'leak' | 'ddos' | 'probe' | 'node') => {
+    sounds.playAlert();
+    const actorName = corporateUser?.name || 'Red Team Hacker';
+
+    if (attackType === 'leak') {
+      setPods(prev =>
+        prev.map(p =>
+          p.deploymentName === 'analytics-worker'
+            ? { ...p, hasMemoryLeak: true, logs: [...p.logs, '[attack] Parasite memory leak injected by Red Team'] }
+            : p
+        )
+      );
+      setBattleEvents(prev => [
+        {
+          id: `attack-${Date.now()}`,
+          timestamp: Date.now(),
+          type: 'attack',
+          actorName,
+          actorTeam: 'red',
+          description: 'Injetou Memory Leak parasita em analytics-worker!',
+          points: 130,
+          target: 'analytics-worker',
+        },
+        ...prev,
+      ]);
+      setGuilds(prev =>
+        prev.map(g => (g.id === currentGuildId ? { ...g, scoreRed: g.scoreRed + 130, totalInjected: g.totalInjected + 1 } : g))
+      );
+    } else if (attackType === 'ddos') {
+      setPods(prev =>
+        prev.map(p =>
+          p.deploymentName === 'payment-gateway'
+            ? { ...p, cpuUsage: Math.round(p.cpuLimit * 0.98) }
+            : p
+        )
+      );
+      setAlerts(prev => [
+        {
+          id: `ddos-${Date.now()}`,
+          type: 'CpuThrottling',
+          severity: 'critical',
+          title: 'Cyber DDoS Wave no Payment Gateway',
+          description: 'Ataque massivo saturou a CPU em 98%! Blue Team precisa escalar réplicas.',
+          targetResource: 'deployment/payment-gateway',
+          timestamp: Date.now(),
+          resolved: false,
+          suggestedAction: 'Escalar replicas para 6 via HPA ou kubectl scale.',
+          autoFixCommand: 'kubectl scale deploy payment-gateway --replicas=6',
+        },
+        ...prev,
+      ]);
+      setBattleEvents(prev => [
+        {
+          id: `attack-${Date.now()}`,
+          timestamp: Date.now(),
+          type: 'attack',
+          actorName,
+          actorTeam: 'red',
+          description: 'Disparou onda DDoS de 5.000 RPS em payment-gateway!',
+          points: 160,
+          target: 'payment-gateway',
+        },
+        ...prev,
+      ]);
+      setGuilds(prev =>
+        prev.map(g => (g.id === currentGuildId ? { ...g, scoreRed: g.scoreRed + 160, totalInjected: g.totalInjected + 1 } : g))
+      );
+    } else if (attackType === 'probe') {
+      setPods(prev =>
+        prev.map(p =>
+          p.deploymentName === 'frontend-edge'
+            ? {
+                ...p,
+                livenessProbe: { ...p.livenessProbe, path: '/bad-healthz', healthy: false },
+                logs: [...p.logs, '[attack] Probe adulterado para /bad-healthz'],
+              }
+            : p
+        )
+      );
+      setBattleEvents(prev => [
+        {
+          id: `attack-${Date.now()}`,
+          timestamp: Date.now(),
+          type: 'attack',
+          actorName,
+          actorTeam: 'red',
+          description: 'Corrompeu Liveness Probe em frontend-edge (induzindo CrashLoopBackOff)!',
+          points: 120,
+          target: 'frontend-edge',
+        },
+        ...prev,
+      ]);
+      setGuilds(prev =>
+        prev.map(g => (g.id === currentGuildId ? { ...g, scoreRed: g.scoreRed + 120, totalInjected: g.totalInjected + 1 } : g))
+      );
+    } else if (attackType === 'node') {
+      setNodes(prev =>
+        prev.map(n =>
+          n.name === 'node-prod-pool-01' ? { ...n, status: 'NotReady', cordoned: true } : n
+        )
+      );
+      setBattleEvents(prev => [
+        {
+          id: `attack-${Date.now()}`,
+          timestamp: Date.now(),
+          type: 'attack',
+          actorName,
+          actorTeam: 'red',
+          description: 'Causou Kernel Panic em node-prod-pool-01 (Nó NotReady)!',
+          points: 190,
+          target: 'node-prod-pool-01',
+        },
+        ...prev,
+      ]);
+      setGuilds(prev =>
+        prev.map(g => (g.id === currentGuildId ? { ...g, scoreRed: g.scoreRed + 190, totalInjected: g.totalInjected + 1 } : g))
+      );
+    }
+
+    awardXp(80);
+  };
+
+  // BLUE TEAM DEFENSE HANDLER (SRE Correções)
+  const handleBlueTeamDefense = (defenseType: 'patch' | 'hpa' | 'probe_repair' | 'drain') => {
+    sounds.playSuccess();
+    const actorName = corporateUser?.name || 'Blue Team SRE';
+
+    if (defenseType === 'patch') {
+      setPods(prev =>
+        prev.map(p =>
+          p.deploymentName === 'analytics-worker'
+            ? { ...p, memLimit: 1024, hasMemoryLeak: false, status: 'Running' }
+            : p
+        )
+      );
+      setDeployments(prev =>
+        prev.map(d => (d.name === 'analytics-worker' ? { ...d, memLimit: 1024 } : d))
+      );
+      setAlerts(prev =>
+        prev.map(a => (a.targetResource.includes('analytics-worker') ? { ...a, resolved: true } : a))
+      );
+      setBattleEvents(prev => [
+        {
+          id: `defense-${Date.now()}`,
+          timestamp: Date.now(),
+          type: 'defense',
+          actorName,
+          actorTeam: 'blue',
+          description: 'Aplicou Patch de Right-Sizing (+512Mi) e estancou Memory Leak!',
+          points: 120,
+          target: 'analytics-worker',
+        },
+        ...prev,
+      ]);
+      setGuilds(prev =>
+        prev.map(g => (g.id === currentGuildId ? { ...g, scoreBlue: g.scoreBlue + 120, totalMitigated: g.totalMitigated + 1 } : g))
+      );
+    } else if (defenseType === 'hpa') {
+      handleScaleDeployment('payment-gateway', 3);
+      setPods(prev =>
+        prev.map(p =>
+          p.deploymentName === 'payment-gateway'
+            ? { ...p, cpuUsage: 250 }
+            : p
+        )
+      );
+      setAlerts(prev =>
+        prev.map(a => (a.targetResource.includes('payment-gateway') ? { ...a, resolved: true } : a))
+      );
+      setBattleEvents(prev => [
+        {
+          id: `defense-${Date.now()}`,
+          timestamp: Date.now(),
+          type: 'defense',
+          actorName,
+          actorTeam: 'blue',
+          description: 'Escalou Payment Gateway para 6 réplicas via HPA, diluindo tráfego!',
+          points: 150,
+          target: 'payment-gateway',
+        },
+        ...prev,
+      ]);
+      setGuilds(prev =>
+        prev.map(g => (g.id === currentGuildId ? { ...g, scoreBlue: g.scoreBlue + 150, totalMitigated: g.totalMitigated + 1 } : g))
+      );
+    } else if (defenseType === 'probe_repair') {
+      setPods(prev =>
+        prev.map(p =>
+          p.deploymentName === 'frontend-edge'
+            ? {
+                ...p,
+                status: 'Running',
+                livenessProbe: { ...p.livenessProbe, path: '/healthz', healthy: true, failCount: 0 },
+                logs: [...p.logs, '[remediation] Liveness probe reconfigurado com sucesso para /healthz'],
+              }
+            : p
+        )
+      );
+      setBattleEvents(prev => [
+        {
+          id: `defense-${Date.now()}`,
+          timestamp: Date.now(),
+          type: 'defense',
+          actorName,
+          actorTeam: 'blue',
+          description: 'Restaurou Liveness Probe para /healthz (Pods voltaram para Running)!',
+          points: 110,
+          target: 'frontend-edge',
+        },
+        ...prev,
+      ]);
+      setGuilds(prev =>
+        prev.map(g => (g.id === currentGuildId ? { ...g, scoreBlue: g.scoreBlue + 110, totalMitigated: g.totalMitigated + 1 } : g))
+      );
+    } else if (defenseType === 'drain') {
+      handleDrainNode('node-worker-01');
+      setBattleEvents(prev => [
+        {
+          id: `defense-${Date.now()}`,
+          timestamp: Date.now(),
+          type: 'defense',
+          actorName,
+          actorTeam: 'blue',
+          description: 'Drenou nó comprometido node-prod-pool-01 e realocou pods sem downtime!',
+          points: 180,
+          target: 'node-prod-pool-01',
+        },
+        ...prev,
+      ]);
+      setGuilds(prev =>
+        prev.map(g => (g.id === currentGuildId ? { ...g, scoreBlue: g.scoreBlue + 180, totalMitigated: g.totalMitigated + 1 } : g))
+      );
+    }
+
+    awardXp(120);
+  };
+
   // Command Effect Handler from CLI Terminal
   const handleApplyCommandEffects = (effects: {
     affectedDeployments?: { name: string; replicas?: number; cpuLimit?: number; memLimit?: number; cpuReq?: number; memReq?: number; hpa?: boolean }[];
     affectedPods?: { id: string; action: 'delete' | 'restart' | 'patch' }[];
     affectedNodes?: { id: string; action: 'drain' | 'uncordon' }[];
   }) => {
-    // 1. Deployments updates (scaling, limits, HPA)
     if (effects.affectedDeployments) {
       effects.affectedDeployments.forEach(aff => {
         setDeployments(prev =>
@@ -363,12 +686,10 @@ export default function App() {
               const updatedMemLimit = aff.memLimit ?? d.memLimit;
               const updatedHpa = aff.hpa ?? d.hpaEnabled;
 
-              // If scaling, adjust pods count
               if (aff.replicas && aff.replicas !== d.replicas) {
                 handleScaleDeployment(d.name, aff.replicas - d.replicas);
               }
 
-              // If memory limit patched, update hosted pods too
               if (aff.memLimit) {
                 setPods(podList =>
                   podList.map(p =>
@@ -395,7 +716,6 @@ export default function App() {
       awardXp(80);
     }
 
-    // 2. Pods updates (delete, restart)
     if (effects.affectedPods) {
       effects.affectedPods.forEach(pEffect => {
         if (pEffect.action === 'delete') {
@@ -407,7 +727,6 @@ export default function App() {
       awardXp(60);
     }
 
-    // 3. Nodes updates (drain, uncordon)
     if (effects.affectedNodes) {
       effects.affectedNodes.forEach(nEffect => {
         if (nEffect.action === 'drain') {
@@ -420,7 +739,6 @@ export default function App() {
     }
   };
 
-  // Restart Pod
   const handleRestartPod = (podId: string) => {
     setPods(prev =>
       prev.map(p => {
@@ -439,14 +757,12 @@ export default function App() {
     );
   };
 
-  // Delete Pod (ReplicaSet will reschedule)
   const handleDeletePod = (podId: string) => {
     setPods(prev => {
       const target = prev.find(p => p.id === podId);
       if (!target) return prev;
       const filtered = prev.filter(p => p.id !== podId);
 
-      // Spawn replacement pod after 1s
       setTimeout(() => {
         const replacement: Pod = {
           ...target,
@@ -466,7 +782,6 @@ export default function App() {
     });
   };
 
-  // Patch Memory Limit on a pod & parent deployment
   const handlePatchMemoryLimit = (podId: string, newLimitMi: number) => {
     setPods(prev =>
       prev.map(p => {
@@ -482,14 +797,12 @@ export default function App() {
       })
     );
 
-    // Auto-resolve corresponding alert
     setAlerts(prev =>
       prev.map(a => (a.targetResource.includes(podId) ? { ...a, resolved: true } : a))
     );
     awardXp(100);
   };
 
-  // Scale Deployment
   const handleScaleDeployment = (deploymentName: string, delta: number) => {
     setDeployments(prev =>
       prev.map(d => {
@@ -502,7 +815,6 @@ export default function App() {
     );
 
     if (delta > 0) {
-      // Add new pods
       const targetDeploy = deployments.find(d => d.name === deploymentName);
       if (targetDeploy) {
         const workerNodes = nodes.filter(n => n.role === 'worker' && !n.cordoned);
@@ -534,7 +846,6 @@ export default function App() {
         sounds.playPodDeploy();
       }
     } else if (delta < 0) {
-      // Scale down (remove latest pods of this deployment)
       setPods(curr => {
         const matching = curr.filter(p => p.deploymentName === deploymentName);
         const toRemove = matching.slice(delta).map(p => p.id);
@@ -544,18 +855,14 @@ export default function App() {
     }
   };
 
-  // Drain Node (Evict pods to other healthy nodes)
   const handleDrainNode = (nodeId: string) => {
-    // 1. Cordon node
     setNodes(prev =>
       prev.map(n => (n.id === nodeId ? { ...n, cordoned: true, status: 'NotReady' } : n))
     );
 
-    // 2. Find healthy available worker nodes
     const otherNodes = nodes.filter(n => n.role === 'worker' && n.id !== nodeId && !n.cordoned);
     if (otherNodes.length === 0) return;
 
-    // 3. Move pods
     setPods(prev =>
       prev.map(p => {
         if (p.nodeId === nodeId) {
@@ -573,7 +880,6 @@ export default function App() {
     awardXp(200);
   };
 
-  // Toggle Cordon Node
   const handleToggleCordon = (nodeId: string) => {
     setNodes(prev =>
       prev.map(n =>
@@ -582,74 +888,8 @@ export default function App() {
     );
   };
 
-  // Start Chaos Scenario
-  const handleStartScenario = (scenario: ChaosScenario) => {
-    sounds.playAlert();
-    setActiveScenario(scenario);
-    setScenarioTimeLeft(scenario.timeLimitSec);
-    setChaosModalOpen(false);
-
-    if (scenario.id === 'scenario-oom') {
-      // Inject memory leak into analytics-worker pod
-      setPods(prev =>
-        prev.map(p =>
-          p.deploymentName === 'analytics-worker'
-            ? { ...p, hasMemoryLeak: true, logs: [...p.logs, '[warning] Memory leak: unreleased telemetry buffer stream'] }
-            : p
-        )
-      );
-    } else if (scenario.id === 'scenario-traffic') {
-      // Inbound traffic surge on payment-gateway
-      setPods(prev =>
-        prev.map(p =>
-          p.deploymentName === 'payment-gateway'
-            ? { ...p, cpuUsage: Math.round(p.cpuLimit * 0.96) }
-            : p
-        )
-      );
-      setAlerts(prev => [
-        {
-          id: `traffic-spike-${Date.now()}`,
-          type: 'CpuThrottling',
-          severity: 'critical',
-          title: 'Payment Gateway CPU Throttling (98%)',
-          description: 'High transaction surge! CPU limit saturated. Scale deployment or enable HPA.',
-          targetResource: 'deployment/payment-gateway',
-          timestamp: Date.now(),
-          resolved: false,
-          suggestedAction: 'Scale replicas to 6 or configure HPA to absorb traffic.',
-          autoFixCommand: 'kubectl scale deploy payment-gateway --replicas=6',
-        },
-        ...prev,
-      ]);
-    } else if (scenario.id === 'scenario-probe') {
-      // Break probe
-      setPods(prev =>
-        prev.map(p =>
-          p.deploymentName === 'frontend-edge'
-            ? {
-                ...p,
-                livenessProbe: { ...p.livenessProbe, path: '/bad-healthz', healthy: false },
-                logs: [...p.logs, '[error] Probe target /bad-healthz returned HTTP 404 Not Found'],
-              }
-            : p
-        )
-      );
-    } else if (scenario.id === 'scenario-node') {
-      // Node panic
-      setNodes(prev =>
-        prev.map(n =>
-          n.name === 'node-prod-pool-01' ? { ...n, status: 'NotReady' } : n
-        )
-      );
-    }
-  };
-
-  // Deploy New Workload
   const handleDeployWorkload = (newDeploy: Deployment) => {
     setDeployments(prev => [...prev, newDeploy]);
-
-    // Schedule pods onto worker nodes
     const workerNodes = nodes.filter(n => n.role === 'worker' && !n.cordoned);
     const newPods: Pod[] = [];
 
@@ -683,12 +923,10 @@ export default function App() {
     unlockBadge('badge-grand-architect');
   };
 
-  // Quick Resolve Alert
   const handleResolveAlert = (alertId: string, fixCommand: string) => {
     setAlerts(prev =>
       prev.map(a => (a.id === alertId ? { ...a, resolved: true } : a))
     );
-    // Parse fix command
     if (fixCommand.includes('scale')) {
       handleScaleDeployment('payment-gateway', 3);
     } else if (fixCommand.includes('limits=memory=')) {
@@ -703,6 +941,11 @@ export default function App() {
     }
     awardXp(100);
   };
+
+  // IF NOT AUTHENTICATED: Show Corporate Auth Gate for @ionsistemas.com.br
+  if (!corporateUser) {
+    return <CorporateAuthGate onAuthenticated={handleAuthenticated} />;
+  }
 
   return (
     <div className="min-h-screen w-full bg-[#070b12] text-slate-100 flex flex-col font-sans select-none overflow-x-hidden">
@@ -729,11 +972,16 @@ export default function App() {
             userProgress={userProgress}
             activeAlertsCount={metrics.activeAlertsCount}
             terminalOpen={terminalOpen}
+            guild={activeGuild}
+            currentUser={corporateUser}
+            currentTeam={currentTeam}
             onToggleTerminal={() => setTerminalOpen(prev => !prev)}
             onOpenAlerts={() => setAlertsModalOpen(true)}
             onOpenLeaderboard={() => setLeaderboardModalOpen(true)}
             onOpenBadges={() => setBadgesModalOpen(true)}
             onOpenChaosModal={() => setChaosModalOpen(true)}
+            onOpenGuildWar={() => setGuildWarModalOpen(true)}
+            onLogout={handleLogout}
             onExitToTitle={() => setGameState('TITLE')}
           />
 
@@ -742,7 +990,7 @@ export default function App() {
             <div className="bg-red-950/80 border-b border-red-800 px-4 py-2 flex items-center justify-between text-xs font-mono">
               <div className="flex items-center gap-2">
                 <span className="w-2.5 h-2.5 rounded-full bg-red-500 animate-ping" />
-                <span className="text-red-300 font-bold uppercase">Active Simulation:</span>
+                <span className="text-red-300 font-bold uppercase">Simulação Ativa:</span>
                 <span className="text-white">{activeScenario.title}</span>
                 <span className="text-slate-400 hidden sm:inline">— {activeScenario.objective}</span>
               </div>
@@ -755,7 +1003,7 @@ export default function App() {
                   }}
                   className="px-2 py-0.5 rounded bg-slate-900 border border-slate-700 text-slate-300 hover:text-white"
                 >
-                  Cancel
+                  Cancelar
                 </button>
               </div>
             </div>
@@ -802,7 +1050,12 @@ export default function App() {
             scenarios={scenarios}
             activeScenario={activeScenario}
             scenarioTimeLeft={scenarioTimeLeft}
-            onStartScenario={handleStartScenario}
+            onStartScenario={scenario => {
+              sounds.playAlert();
+              setActiveScenario(scenario);
+              setScenarioTimeLeft(scenario.timeLimitSec);
+              setChaosModalOpen(false);
+            }}
             onAbortScenario={() => setActiveScenario(null)}
           />
 
@@ -855,6 +1108,22 @@ export default function App() {
               setTerminalOpen(true);
               handleApplyCommandEffects({});
             }}
+          />
+
+          {/* Guild War Arena Modal (Red Team vs Blue Team) */}
+          <GuildWarModal
+            isOpen={guildWarModalOpen}
+            onClose={() => setGuildWarModalOpen(false)}
+            guild={activeGuild}
+            currentUser={corporateUser}
+            currentTeam={currentTeam}
+            battleEvents={battleEvents}
+            onSwitchTeam={team => {
+              setCurrentTeam(team);
+              sounds.playBlip(600);
+            }}
+            onRedTeamAttack={handleRedTeamAttack}
+            onBlueTeamDefense={handleBlueTeamDefense}
           />
         </div>
       )}
