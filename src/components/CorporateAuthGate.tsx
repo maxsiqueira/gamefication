@@ -1,5 +1,4 @@
 import React from 'react';
-import QRCode from 'qrcode';
 import { 
   AlertOctagon, 
   Lock, 
@@ -8,13 +7,10 @@ import {
   ArrowRight, 
   CheckCircle2, 
   RefreshCw, 
-  KeyRound, 
   Mail, 
-  QrCode, 
-  Smartphone, 
   Clock, 
-  Copy, 
-  Check 
+  ShieldCheck,
+  KeyRound
 } from 'lucide-react';
 import { 
   CorporateUser, 
@@ -24,14 +20,10 @@ import {
   parseJwtPayload 
 } from '../utils/corporateAuth';
 import { 
-  generateBase32Secret, 
-  buildOtpAuthUri, 
-  verifyTotpCode 
-} from '../utils/totp';
-import { 
   dispatchEmailPin, 
   verifySubmittedPin 
 } from '../utils/emailService';
+import { MfaSetupModal } from './MfaSetupModal';
 import { TeamSide, INITIAL_GUILDS } from '../types/guild';
 import { sounds } from '../utils/audio';
 
@@ -42,30 +34,25 @@ interface CorporateAuthGateProps {
 export const CorporateAuthGate: React.FC<CorporateAuthGateProps> = ({
   onAuthenticated,
 }) => {
-  // STRICT: Form fields start 100% empty!
+  // STRICT: Form fields start 100% empty
   const [emailInput, setEmailInput] = React.useState('');
   const [nameInput, setNameInput] = React.useState('');
   const [selectedTeam, setSelectedTeam] = React.useState<TeamSide>('blue');
   const [selectedGuildId, setSelectedGuildId] = React.useState<string>(INITIAL_GUILDS[0].id);
 
-  // 4 Security Stages:
-  // 1. 'email' -> Inserir e-mail @ionsistemas.com.br
+  // Security Stages:
+  // 1. 'email' -> Digitar email institucional @ionsistemas.com.br
   // 2. 'email_pin' -> Validar PIN de 6 dígitos enviado por e-mail (SEM EXIBIÇÃO EM TELA)
-  // 3. 'mfa_totp' -> Escanear QR Code com Google/MS Authenticator no celular e validar token
-  // 4. 'guild_team' -> Selecionar guilda e time de batalha (Blue ou Red)
-  const [stage, setStage] = React.useState<'email' | 'email_pin' | 'mfa_totp' | 'guild_team'>('email');
+  // 3. 'guild_team' -> Após MFA aprovado no MfaSetupModal, escolhe Guilda e Time
+  const [stage, setStage] = React.useState<'email' | 'email_pin' | 'guild_team'>('email');
 
   // Stage 2: Email PIN state
   const [submittedPin, setSubmittedPin] = React.useState('');
   const [pinError, setPinError] = React.useState<string | null>(null);
   const [pinCooldown, setPinCooldown] = React.useState<number>(0);
 
-  // Stage 3: MFA TOTP state
-  const [totpSecret, setTotpSecret] = React.useState<string>('');
-  const [totpInput, setTotpInput] = React.useState('');
-  const [totpError, setTotpError] = React.useState<string | null>(null);
-  const [copiedSecret, setCopiedSecret] = React.useState(false);
-  const qrCanvasRef = React.useRef<HTMLCanvasElement>(null);
+  // MfaSetupModal visibility state
+  const [isMfaModalOpen, setIsMfaModalOpen] = React.useState<boolean>(false);
 
   // Access Denied full-screen state
   const [blockedEmail, setBlockedEmail] = React.useState<string | null>(null);
@@ -79,23 +66,6 @@ export const CorporateAuthGate: React.FC<CorporateAuthGateProps> = ({
     const timer = setInterval(() => setPinCooldown(prev => prev - 1), 1000);
     return () => clearInterval(timer);
   }, [pinCooldown]);
-
-  // Render QR Code onto canvas when in mfa_totp stage
-  React.useEffect(() => {
-    if (stage === 'mfa_totp' && totpSecret && qrCanvasRef.current) {
-      const uri = buildOtpAuthUri(emailInput, totpSecret, 'ION Sistemas');
-      QRCode.toCanvas(qrCanvasRef.current, uri, {
-        width: 190,
-        margin: 1.5,
-        color: {
-          dark: '#0f172a',
-          light: '#ffffff',
-        },
-      }).catch(err => {
-        console.warn('Erro ao desenhar QR Code:', err);
-      });
-    }
-  }, [stage, totpSecret, emailInput]);
 
   // Google Identity Services Setup
   React.useEffect(() => {
@@ -124,14 +94,11 @@ export const CorporateAuthGate: React.FC<CorporateAuthGateProps> = ({
                   sounds.playAlert();
                   setBlockedEmail(clean);
                 } else {
-                  // Email valid via Google: proceed to Camada 2 (MFA TOTP)
                   sounds.playSuccess();
                   setEmailInput(clean);
                   setNameInput(payload.name || payload.given_name || clean.split('@')[0]);
-                  
-                  const secret = generateBase32Secret(16);
-                  setTotpSecret(secret);
-                  setStage('mfa_totp');
+                  // Open MfaSetupModal directly for Google verified emails
+                  setIsMfaModalOpen(true);
                 }
               }
             }
@@ -146,12 +113,12 @@ export const CorporateAuthGate: React.FC<CorporateAuthGateProps> = ({
           width: 320,
         });
       } catch {
-        // Fallback
+        // Fallback handled
       }
     }
   }, []);
 
-  // STEP 1: Handle email submission & dispatch PIN
+  // STEP 1: Handle email submission & dispatch confidential PIN
   const handleEmailSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     const cleanEmail = emailInput.trim().toLowerCase();
@@ -166,7 +133,6 @@ export const CorporateAuthGate: React.FC<CorporateAuthGateProps> = ({
     }
 
     sounds.playBlip(600);
-    // Dispatch PIN to the user's corporate email inbox
     const res = dispatchEmailPin(cleanEmail);
     if (!res.success) {
       sounds.playAlert();
@@ -174,7 +140,6 @@ export const CorporateAuthGate: React.FC<CorporateAuthGateProps> = ({
       return;
     }
 
-    // Set cooldown & proceed to PIN verification stage
     setPinCooldown(60);
     setSubmittedPin('');
     setPinError(null);
@@ -192,31 +157,15 @@ export const CorporateAuthGate: React.FC<CorporateAuthGateProps> = ({
       return;
     }
 
-    // Camada 1 Aprovada! Prosseguir para Camada 2 (MFA TOTP com QR Code)
+    // Camada 1 Aprovada! Agora aciona obrigatoriamente o MfaSetupModal para a Camada 2
     sounds.playSuccess();
     setPinError(null);
-
-    const secret = generateBase32Secret(16);
-    setTotpSecret(secret);
-    setTotpInput('');
-    setTotpError(null);
-    setStage('mfa_totp');
+    setIsMfaModalOpen(true);
   };
 
-  // STEP 3: Handle TOTP 6-digit code verification from mobile authenticator
-  const handleTotpSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    const isValid = await verifyTotpCode(totpSecret, totpInput);
-
-    if (!isValid) {
-      sounds.playAlert();
-      setTotpError('Código do autenticador incorreto ou expirado. Verifique o relógio do seu celular e tente novamente.');
-      return;
-    }
-
-    // Camada 2 Aprovada! 2FA / MFA Concluído com Sucesso!
-    sounds.playSuccess();
-    setTotpError(null);
+  // Callback when MfaSetupModal validates the TOTP token from user's phone
+  const handleMfaSuccess = (totpSecret: string) => {
+    setIsMfaModalOpen(false);
 
     const cleanEmail = emailInput.trim().toLowerCase();
     const user: CorporateUser = {
@@ -225,24 +174,19 @@ export const CorporateAuthGate: React.FC<CorporateAuthGateProps> = ({
       domain: ALLOWED_DOMAIN,
       role: 'SRE Specialist',
       picture: '👨‍💻',
+      mfaVerified: true,
     };
 
     setVerifiedUser(user);
     setStage('guild_team');
   };
 
-  // STEP 4: Confirm guild & combat team, and release cluster
+  // STEP 3: Confirm guild & combat team, and release cluster
   const handleFinalizeLogin = () => {
     if (!verifiedUser) return;
     sounds.playSuccess();
     saveCorporateUser(verifiedUser);
     onAuthenticated(verifiedUser, selectedTeam, selectedGuildId);
-  };
-
-  const handleCopySecret = () => {
-    navigator.clipboard.writeText(totpSecret);
-    setCopiedSecret(true);
-    setTimeout(() => setCopiedSecret(false), 2000);
   };
 
   // FULL-SCREEN RED ACCESS BLOCKED SCREEN FOR UNAUTHORIZED DOMAINS
@@ -277,7 +221,7 @@ export const CorporateAuthGate: React.FC<CorporateAuthGateProps> = ({
               E-mail recusado: <span className="text-red-400 font-bold underline">{blockedEmail}</span>
             </div>
             <div className="text-slate-300">
-              Motivo do bloqueio: <span className="text-amber-400">Domínio não autorizado.</span>
+              Motivo do bloqueio: <span className="text-amber-400">Domínio externo não autorizado.</span>
             </div>
             <div className="text-slate-400 text-[11px] pt-2 border-t border-red-900/40">
               O simulador Kubernetes e a arena de guildas são restritos exclusivamente a colaboradores com e-mail institucional <strong className="text-emerald-400">@{ALLOWED_DOMAIN}</strong> da ION Sistemas.
@@ -328,32 +272,30 @@ export const CorporateAuthGate: React.FC<CorporateAuthGateProps> = ({
             KubeCommander Arena
           </h1>
           <p className="text-xs text-slate-400 mt-1 max-w-md mx-auto">
-            Autenticação em 2 camadas de segurança: PIN por e-mail corporativo + MFA no celular
+            Autenticação obrigatória com 2 camadas: PIN confidencial por e-mail + MFA TOTP com QR Code
           </p>
 
           {/* Stepper indicator */}
           <div className="flex items-center justify-center gap-2 mt-4 text-[10px] font-mono">
             <span className={`px-2 py-0.5 rounded ${stage === 'email' ? 'bg-blue-600 text-white font-bold' : 'bg-slate-800 text-slate-400'}`}>
-              1. E-mail
+              1. E-mail @{ALLOWED_DOMAIN}
             </span>
             <span className="text-slate-600">→</span>
             <span className={`px-2 py-0.5 rounded ${stage === 'email_pin' ? 'bg-blue-600 text-white font-bold' : 'bg-slate-800 text-slate-400'}`}>
               2. PIN no E-mail
             </span>
             <span className="text-slate-600">→</span>
-            <span className={`px-2 py-0.5 rounded ${stage === 'mfa_totp' ? 'bg-blue-600 text-white font-bold' : 'bg-slate-800 text-slate-400'}`}>
+            <span className={`px-2 py-0.5 rounded ${isMfaModalOpen ? 'bg-purple-600 text-white font-bold' : 'bg-slate-800 text-slate-400'}`}>
               3. MFA QR Code
             </span>
             <span className="text-slate-600">→</span>
             <span className={`px-2 py-0.5 rounded ${stage === 'guild_team' ? 'bg-emerald-600 text-white font-bold' : 'bg-slate-800 text-slate-400'}`}>
-              4. Guilda
+              4. Guilda & Cluster
             </span>
           </div>
         </div>
 
-        {/* ========================================================================= */}
-        {/* STAGE 1: ENTER CORPORATE EMAIL                                            */}
-        {/* ========================================================================= */}
+        {/* STAGE 1: ENTER CORPORATE EMAIL */}
         {stage === 'email' && (
           <div className="p-6 space-y-5">
             {/* Google Workspace Area */}
@@ -373,12 +315,12 @@ export const CorporateAuthGate: React.FC<CorporateAuthGateProps> = ({
             <div className="relative flex py-1 items-center">
               <div className="flex-grow border-t border-slate-800"></div>
               <span className="flex-shrink mx-3 text-[10px] font-mono text-slate-500 uppercase">
-                Ou acesse com e-mail corporativo
+                Ou digite seu e-mail corporativo
               </span>
               <div className="flex-grow border-t border-slate-800"></div>
             </div>
 
-            {/* Manual Form (Starts 100% EMPTY) */}
+            {/* Email Form (Starts 100% EMPTY) */}
             <form onSubmit={handleEmailSubmit} className="space-y-4">
               <div>
                 <label className="text-xs font-semibold text-slate-300 block mb-1">
@@ -423,12 +365,9 @@ export const CorporateAuthGate: React.FC<CorporateAuthGateProps> = ({
           </div>
         )}
 
-        {/* ========================================================================= */}
-        {/* STAGE 2: VERIFY EMAIL PIN (CONFIDENTIAL - NEVER DISPLAYED ON SCREEN)       */}
-        {/* ========================================================================= */}
+        {/* STAGE 2: VERIFY EMAIL PIN (CONFIDENTIAL - NEVER DISPLAYED ON SCREEN) */}
         {stage === 'email_pin' && (
           <div className="p-6 space-y-5">
-            {/* Confidential Email Notice */}
             <div className="p-4 rounded-xl bg-blue-950/40 border border-blue-800/60 flex items-start gap-3">
               <Mail className="w-5 h-5 text-blue-400 shrink-0 mt-0.5" />
               <div className="text-xs leading-relaxed">
@@ -512,103 +451,9 @@ export const CorporateAuthGate: React.FC<CorporateAuthGateProps> = ({
           </div>
         )}
 
-        {/* ========================================================================= */}
-        {/* STAGE 3: CAMADA 2 - MFA TOTP COM QR CODE (GOOGLE/MS AUTHENTICATOR)        */}
-        {/* ========================================================================= */}
-        {stage === 'mfa_totp' && (
-          <div className="p-6 space-y-5">
-            {/* Header info */}
-            <div className="p-4 rounded-xl bg-purple-950/40 border border-purple-800/60 flex items-start gap-3">
-              <Smartphone className="w-5 h-5 text-purple-400 shrink-0 mt-0.5" />
-              <div className="text-xs leading-relaxed">
-                <div className="font-bold text-white mb-0.5">
-                  Camada 2: Autenticação Multifator (MFA TOTP)
-                </div>
-                <div className="text-slate-300">
-                  Abra o <strong>Google Authenticator</strong> ou <strong>Microsoft Authenticator</strong> no seu celular e escaneie o QR Code abaixo.
-                </div>
-              </div>
-            </div>
-
-            {/* QR Code Canvas */}
-            <div className="flex flex-col items-center justify-center p-4 bg-white rounded-2xl max-w-[220px] mx-auto shadow-xl">
-              <canvas ref={qrCanvasRef} className="rounded-lg" />
-              <span className="text-[10px] font-mono font-bold text-slate-800 mt-1 uppercase tracking-wider">
-                ION Sistemas MFA
-              </span>
-            </div>
-
-            {/* Manual Secret Key */}
-            <div className="p-2.5 rounded-lg bg-slate-950 border border-slate-800 flex items-center justify-between text-xs font-mono">
-              <div className="overflow-hidden">
-                <span className="text-slate-500 text-[10px] block">Chave manual para o aplicativo:</span>
-                <span className="text-purple-300 font-bold tracking-wider">{totpSecret}</span>
-              </div>
-              <button
-                type="button"
-                onClick={handleCopySecret}
-                className="p-1.5 rounded bg-slate-900 hover:bg-slate-800 text-slate-300 hover:text-white transition-colors"
-                title="Copiar Chave"
-              >
-                {copiedSecret ? <Check className="w-4 h-4 text-emerald-400" /> : <Copy className="w-4 h-4" />}
-              </button>
-            </div>
-
-            {totpError && (
-              <div className="p-3 rounded-lg bg-red-950/80 border border-red-800 text-xs text-red-200">
-                {totpError}
-              </div>
-            )}
-
-            {/* TOTP 6-Digit Form */}
-            <form onSubmit={handleTotpSubmit} className="space-y-4">
-              <div>
-                <label className="text-xs font-semibold text-slate-300 block mb-1">
-                  Digite o código de 6 dígitos gerado no app do celular:
-                </label>
-                <input
-                  type="text"
-                  maxLength={6}
-                  required
-                  autoFocus
-                  value={totpInput}
-                  onChange={e => setTotpInput(e.target.value.replace(/\D/g, ''))}
-                  placeholder="000000"
-                  className="w-full text-center tracking-widest px-3.5 py-3 bg-slate-950 border border-slate-800 rounded-xl text-xl font-mono text-white focus:outline-none focus:border-purple-500 placeholder-slate-700"
-                />
-              </div>
-
-              <div className="flex gap-2">
-                <button
-                  type="button"
-                  onClick={() => {
-                    sounds.playBlip();
-                    setStage('email_pin');
-                  }}
-                  className="w-1/3 py-2.5 rounded-xl bg-slate-900 hover:bg-slate-800 text-slate-300 text-xs font-semibold transition-colors"
-                >
-                  Voltar
-                </button>
-
-                <button
-                  type="submit"
-                  disabled={totpInput.length < 6}
-                  className="w-2/3 py-2.5 rounded-xl bg-purple-600 hover:bg-purple-500 disabled:bg-slate-800 disabled:text-slate-500 disabled:cursor-not-allowed text-white font-semibold text-xs transition-colors flex items-center justify-center gap-2 cursor-pointer shadow-md"
-                >
-                  <span>Validar MFA e Concluir</span>
-                  <CheckCircle2 className="w-4 h-4" />
-                </button>
-              </div>
-            </form>
-          </div>
-        )}
-
-        {/* ========================================================================= */}
-        {/* STAGE 4: SELECT GUILD & COMBAT TEAM                                       */}
-        {/* ========================================================================= */}
+        {/* STAGE 3: SELECT GUILD & COMBAT TEAM (AFTER MFA COMPLETED) */}
         {stage === 'guild_team' && (
           <div className="p-6 space-y-5">
-            {/* 2FA Verified Badge */}
             <div className="p-3.5 rounded-xl bg-emerald-950/40 border border-emerald-800/60 flex items-center justify-between">
               <div className="flex items-center gap-2.5">
                 <div className="w-9 h-9 rounded-lg bg-emerald-500/20 text-emerald-400 flex items-center justify-center font-bold">
@@ -738,6 +583,14 @@ export const CorporateAuthGate: React.FC<CorporateAuthGateProps> = ({
           Ambiente corporativo restrito e protegido · ION Sistemas Telecom & Cloud
         </div>
       </div>
+
+      {/* DEDICATED MFA SETUP MODAL FOR TOTP QR CODE SCANNING */}
+      <MfaSetupModal
+        isOpen={isMfaModalOpen}
+        email={emailInput}
+        onSuccess={handleMfaSuccess}
+        onCancel={() => setIsMfaModalOpen(false)}
+      />
     </div>
   );
 };
