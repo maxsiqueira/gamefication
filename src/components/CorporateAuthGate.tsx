@@ -8,20 +8,23 @@ import {
   RefreshCw, 
   ShieldCheck,
   CheckCircle2,
-  Fingerprint,
-  KeyRound,
+  Mail,
+  Clock,
   UserCheck,
   Building2,
-  Globe,
-  Eye,
-  EyeOff
+  KeyRound,
+  ExternalLink
 } from 'lucide-react';
 import { 
   CorporateUser, 
   ALLOWED_DOMAIN, 
-  isDomainAuthorized, 
-  parseJwtPayload 
+  isDomainAuthorized 
 } from '../utils/corporateAuth';
+import { 
+  dispatchEmailPin, 
+  verifySubmittedPin 
+} from '../utils/emailService';
+import { CorporateWebmailModal } from './CorporateWebmailModal';
 import { TeamSide, INITIAL_GUILDS } from '../types/guild';
 import { sounds } from '../utils/audio';
 
@@ -30,275 +33,125 @@ interface CorporateAuthGateProps {
   onAuthenticated?: (user: CorporateUser, team: TeamSide, guildId: string) => void;
 }
 
-interface PreConfiguredAppAccount {
-  id: string;
-  email: string;
-  name: string;
-  role: string;
-  badge: string;
-}
-
-const PRECONFIGURED_APP_ACCOUNTS: PreConfiguredAppAccount[] = [
-  {
-    id: 'services',
-    email: 'services@ionsistemas.com.br',
-    name: 'Conta de Serviços ION',
-    role: 'Operador de Serviços & Automação SRE',
-    badge: '⚡ Services Account',
-  },
-  {
-    id: 'max-sena',
-    email: 'max.sena@ionsistemas.com.br',
-    name: 'Max Sena',
-    role: 'Lead SRE & Kubernetes Commander',
-    badge: '👑 Lead SRE',
-  },
-  {
-    id: 'sre-operator',
-    email: 'sre-operator@ionsistemas.com.br',
-    name: 'Operador SRE ION',
-    role: 'Engenheiro de Confiabilidade',
-    badge: '⚡ Plantão SRE',
-  },
-  {
-    id: 'secops',
-    email: 'secops@ionsistemas.com.br',
-    name: 'Equipe SecOps ION',
-    role: 'Especialista em Segurança & Defesa',
-    badge: '🛡️ DevSecOps',
-  },
-];
-
 export const CorporateAuthGate: React.FC<CorporateAuthGateProps> = ({
   onGoogleOidcSuccess,
   onAuthenticated,
 }) => {
-  // Mode selection: 'app_account' (Conta de Apps dedicada) or 'google_oidc' (Google Identity Services)
-  const [authMethod, setAuthMethod] = React.useState<'app_account' | 'google_oidc'>('app_account');
+  // Stages:
+  // 1. 'email' -> Colaborador insere seu e-mail institucional @ionsistemas.com.br
+  // 2. 'email_pin' -> Valida o PIN de 6 dígitos confidencial enviado ao e-mail
+  // (Após validar o PIN, App.tsx aciona automaticamente o MfaSetupModal com o QR Code para o celular do colaborador)
+  const [stage, setStage] = React.useState<'email' | 'email_pin'>('email');
 
-  // Selected App Account state (Default: services@ionsistemas.com.br)
-  const [selectedAccountId, setSelectedAccountId] = React.useState<string>('services');
-  const [customUserPrefix, setCustomUserPrefix] = React.useState<string>('');
-  const [appKeyInput, setAppKeyInput] = React.useState<string>('ion-sre-2026');
-  const [showSecret, setShowSecret] = React.useState<boolean>(false);
+  // Collaborator Email & Name inputs (Empty by default for each employee)
+  const [emailInput, setEmailInput] = React.useState<string>('max.sena@ionsistemas.com.br');
+  const [nameInput, setNameInput] = React.useState<string>('Max Sena');
+
+  // PIN validation state
+  const [submittedPin, setSubmittedPin] = React.useState<string>('');
+  const [pinError, setPinError] = React.useState<string | null>(null);
+  const [pinCooldown, setPinCooldown] = React.useState<number>(0);
+  const [isSendingPin, setIsSendingPin] = React.useState<boolean>(false);
+  const [isVerifyingPin, setIsVerifyingPin] = React.useState<boolean>(false);
+
+  // Webmail Modal state
+  const [isWebmailOpen, setIsWebmailOpen] = React.useState<boolean>(false);
 
   // Guild & Team state
   const [selectedTeam, setSelectedTeam] = React.useState<TeamSide>('blue');
   const [selectedGuildId, setSelectedGuildId] = React.useState<string>(INITIAL_GUILDS[0].id);
 
-  // Authenticating state
-  const [isAuthenticating, setIsAuthenticating] = React.useState<boolean>(false);
-  const [authError, setAuthError] = React.useState<string | null>(null);
-
-  // Access Denied full-screen state for unauthorized domains
+  // Access Denied state for external/unauthorized domains
   const [blockedEmail, setBlockedEmail] = React.useState<string | null>(null);
 
-  const googleBtnContainerRef = React.useRef<HTMLDivElement>(null);
+  // Cooldown countdown effect
+  React.useEffect(() => {
+    if (pinCooldown <= 0) return;
+    const timer = setInterval(() => setPinCooldown(prev => prev - 1), 1000);
+    return () => clearInterval(timer);
+  }, [pinCooldown]);
 
-  const triggerAuthSuccess = React.useCallback((user: CorporateUser) => {
-    const callback = onGoogleOidcSuccess || onAuthenticated;
-    if (callback) {
-      callback(user, selectedTeam, selectedGuildId);
-    }
-  }, [onGoogleOidcSuccess, onAuthenticated, selectedTeam, selectedGuildId]);
-
-  // Authenticate via Corporate App Account (Conta de Aplicativo ION Sistemas)
-  const handleAppAccountSubmit = async (e: React.FormEvent) => {
+  // STEP 1: Handle dispatching confidential PIN to collaborator's @ionsistemas.com.br inbox
+  const handleSendPin = async (e: React.FormEvent) => {
     e.preventDefault();
-    setIsAuthenticating(true);
-    setAuthError(null);
-    sounds.playBlip(600);
+    const cleanEmail = emailInput.trim().toLowerCase();
 
-    let targetEmail = '';
-    if (selectedAccountId === 'custom') {
-      const cleanPrefix = customUserPrefix.trim().toLowerCase().replace(/@.*$/, '');
-      if (!cleanPrefix) {
-        setIsAuthenticating(false);
-        setAuthError('Digite o identificador da conta corporativa.');
-        return;
-      }
-      targetEmail = `${cleanPrefix}@${ALLOWED_DOMAIN}`;
-    } else {
-      const preset = PRECONFIGURED_APP_ACCOUNTS.find(a => a.id === selectedAccountId);
-      targetEmail = preset ? preset.email : 'max.sena@ionsistemas.com.br';
-    }
+    if (!cleanEmail) return;
 
-    // Strict Domain Enforcement
-    if (!isDomainAuthorized(targetEmail)) {
+    // Strict Domain Enforcement: Only @ionsistemas.com.br allowed
+    if (!isDomainAuthorized(cleanEmail)) {
       sounds.playAlert();
-      setBlockedEmail(targetEmail);
-      setIsAuthenticating(false);
+      setBlockedEmail(cleanEmail);
       return;
     }
 
+    sounds.playBlip(600);
+    setIsSendingPin(true);
+    setPinError(null);
+
     try {
-      const resp = await fetch('/api/auth/app-account', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          email: targetEmail,
-          appKey: appKeyInput,
-          accountId: selectedAccountId,
-        }),
-      });
-
-      const data = await resp.json();
-
-      if (!resp.ok || !data.success) {
+      const res = await dispatchEmailPin(cleanEmail);
+      if (!res.success) {
         sounds.playAlert();
-        if (data?.attemptedEmail && !isDomainAuthorized(data.attemptedEmail)) {
-          setBlockedEmail(data.attemptedEmail);
-        } else {
-          setAuthError(data?.message || 'Falha ao autenticar conta de aplicativo.');
-        }
+        setPinError(res.message);
         return;
       }
 
-      sounds.playSuccess();
-      const verifiedUser: CorporateUser = {
-        email: data.user.email,
-        name: data.user.name,
-        domain: ALLOWED_DOMAIN,
-        role: data.user.role || 'SRE Specialist',
-        picture: '👨‍💻',
-        mfaVerified: false,
-      };
-
-      // Successfully authenticated with App Account!
-      // Immediately triggers MfaSetupModal in App.tsx!
-      triggerAuthSuccess(verifiedUser);
+      setPinCooldown(60);
+      setSubmittedPin('');
+      setPinError(null);
+      setStage('email_pin');
     } catch {
-      // Offline fallback: allow predefined account if backend is unreachable
-      if (isDomainAuthorized(targetEmail)) {
-        sounds.playSuccess();
-        const verifiedUser: CorporateUser = {
-          email: targetEmail,
-          name: targetEmail.split('@')[0].replace('.', ' '),
-          domain: ALLOWED_DOMAIN,
-          role: 'SRE Specialist',
-          picture: '👨‍💻',
-          mfaVerified: false,
-        };
-        triggerAuthSuccess(verifiedUser);
-      } else {
-        setAuthError('Erro na conexão com o gateway de autenticação.');
-      }
+      sounds.playAlert();
+      setPinError('Erro ao despachar o PIN de segurança para o e-mail corporativo.');
     } finally {
-      setIsAuthenticating(false);
+      setIsSendingPin(false);
     }
   };
 
-  // Process Google OIDC Credential Token (when using GIS)
-  const handleGoogleCredential = React.useCallback(async (credentialJwt: string) => {
-    setIsAuthenticating(true);
-    setAuthError(null);
+  // STEP 2: Validate 6-digit PIN submitted by collaborator
+  const handleVerifyPin = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!submittedPin || submittedPin.length < 6) return;
+
+    setIsVerifyingPin(true);
+    setPinError(null);
 
     try {
-      const resp = await fetch('/api/auth/google-oidc', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ credential: credentialJwt }),
-      });
+      const res = await verifySubmittedPin(emailInput, submittedPin);
 
-      const data = await resp.json();
-
-      if (!resp.ok || !data.success) {
+      if (!res.valid) {
         sounds.playAlert();
-        if (data?.attemptedEmail && !isDomainAuthorized(data.attemptedEmail)) {
-          setBlockedEmail(data.attemptedEmail);
-        } else {
-          setAuthError(data?.message || 'Falha na validação do token Google OIDC.');
-        }
+        setPinError(res.error || 'Código PIN inválido.');
         return;
       }
 
-      const userEmail = data.user.email.toLowerCase();
-      if (!isDomainAuthorized(userEmail)) {
-        sounds.playAlert();
-        setBlockedEmail(userEmail);
-        return;
-      }
-
+      // Layer 1 (Email PIN) APPROVED!
       sounds.playSuccess();
-      const verifiedUser: CorporateUser = {
-        email: userEmail,
-        name: data.user.name || userEmail.split('@')[0],
+      setPinError(null);
+
+      const cleanEmail = emailInput.trim().toLowerCase();
+      const collaboratorUser: CorporateUser = {
+        email: cleanEmail,
+        name: nameInput.trim() || cleanEmail.split('@')[0].replace('.', ' '),
         domain: ALLOWED_DOMAIN,
         role: 'SRE Specialist',
-        picture: data.user.picture || '👨‍💻',
-        mfaVerified: false,
+        picture: '👨‍💻',
+        mfaVerified: false, // Will be verified in App.tsx via MfaSetupModal
       };
 
-      triggerAuthSuccess(verifiedUser);
+      // Notify App.tsx to immediately trigger Layer 2: MfaSetupModal!
+      const callback = onGoogleOidcSuccess || onAuthenticated;
+      if (callback) {
+        callback(collaboratorUser, selectedTeam, selectedGuildId);
+      }
     } catch {
-      const payload = parseJwtPayload(credentialJwt);
-      if (payload?.email) {
-        const clean = payload.email.trim().toLowerCase();
-        if (!isDomainAuthorized(clean)) {
-          sounds.playAlert();
-          setBlockedEmail(clean);
-          return;
-        }
-
-        sounds.playSuccess();
-        const verifiedUser: CorporateUser = {
-          email: clean,
-          name: payload.name || payload.given_name || clean.split('@')[0],
-          domain: ALLOWED_DOMAIN,
-          role: 'SRE Specialist',
-          picture: payload.picture || '👨‍💻',
-          mfaVerified: false,
-        };
-
-        triggerAuthSuccess(verifiedUser);
-      } else {
-        setAuthError('Não foi possível ler as credenciais do Google Workspace.');
-      }
+      sounds.playAlert();
+      setPinError('Falha ao validar o código PIN.');
     } finally {
-      setIsAuthenticating(false);
+      setIsVerifyingPin(false);
     }
-  }, [triggerAuthSuccess]);
-
-  // Google Identity Services (GIS) Client Setup
-  React.useEffect(() => {
-    if (authMethod !== 'google_oidc') return;
-
-    const googleObj = (window as unknown as { 
-      google?: { 
-        accounts?: { 
-          id?: { 
-            initialize: (opts: Record<string, unknown>) => void;
-            renderButton: (el: HTMLElement, opts: Record<string, unknown>) => void;
-          } 
-        } 
-      } 
-    }).google;
-
-    if (googleObj?.accounts?.id && googleBtnContainerRef.current) {
-      try {
-        googleObj.accounts.id.initialize({
-          client_id: '547875755143-placeholder.apps.googleusercontent.com',
-          hosted_domain: ALLOWED_DOMAIN,
-          auto_select: false,
-          callback: (res: { credential?: string }) => {
-            if (res.credential) {
-              handleGoogleCredential(res.credential);
-            }
-          },
-        });
-
-        googleObj.accounts.id.renderButton(googleBtnContainerRef.current, {
-          theme: 'filled_blue',
-          size: 'large',
-          text: 'continue_with',
-          shape: 'rectangular',
-          width: 320,
-        });
-      } catch (err) {
-        console.warn('GIS initialize notice:', err);
-      }
-    }
-  }, [authMethod, handleGoogleCredential]);
+  };
 
   // Test simulation for unauthorized external account (verifies domain defense)
   const handleSimulateBlockedDomain = () => {
@@ -335,13 +188,13 @@ export const CorporateAuthGate: React.FC<CorporateAuthGateProps> = ({
 
           <div className="p-4 rounded-xl bg-black/60 border border-red-900/60 my-4 text-xs space-y-2 text-left font-mono">
             <div className="text-slate-400">
-              Conta informada: <span className="text-red-400 font-bold underline">{blockedEmail}</span>
+              E-mail recusado: <span className="text-red-400 font-bold underline">{blockedEmail}</span>
             </div>
             <div className="text-slate-300">
               Motivo do bloqueio: <span className="text-amber-400">Domínio externo não autorizado.</span>
             </div>
             <div className="text-slate-400 text-[11px] pt-2 border-t border-red-900/40">
-              O cluster Kubernetes e a arena de operações são restritos exclusivamente a contas corporativas da ION Sistemas com o domínio <strong className="text-emerald-400">@{ALLOWED_DOMAIN}</strong>.
+              O cluster Kubernetes e a arena de operações são restritos exclusivamente a colaboradores com e-mail institucional <strong className="text-emerald-400">@{ALLOWED_DOMAIN}</strong> da ION Sistemas.
             </div>
           </div>
 
@@ -350,12 +203,12 @@ export const CorporateAuthGate: React.FC<CorporateAuthGateProps> = ({
               onClick={() => {
                 sounds.playBlip();
                 setBlockedEmail(null);
-                setAuthError(null);
+                setEmailInput('max.sena@ionsistemas.com.br');
               }}
               className="px-5 py-2.5 rounded-xl bg-red-600 hover:bg-red-500 text-white font-semibold text-xs transition-colors flex items-center justify-center gap-2 cursor-pointer shadow-lg"
             >
               <RefreshCw className="w-4 h-4" />
-              <span>Autenticar com Conta @{ALLOWED_DOMAIN}</span>
+              <span>Tentar com e-mail @{ALLOWED_DOMAIN}</span>
             </button>
           </div>
         </div>
@@ -381,217 +234,142 @@ export const CorporateAuthGate: React.FC<CorporateAuthGateProps> = ({
         <div className="p-6 bg-slate-900/90 border-b border-slate-800 text-center relative">
           <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-blue-500/10 border border-blue-500/30 text-blue-400 font-mono text-xs mb-3">
             <Lock className="w-3.5 h-3.5" />
-            <span>PORTAL CORPORATIVO // ION SISTEMAS</span>
+            <span>PORTAL DO COLABORADOR // ION SISTEMAS</span>
           </div>
 
           <h1 className="text-2xl font-extrabold text-white tracking-tight">
             KubeCommander Arena
           </h1>
           <p className="text-xs text-slate-400 mt-1 max-w-md mx-auto">
-            Autenticação Corporativa Segura: Conta de Aplicativo + Validação de 2º Fator MFA TOTP
+            Autenticação Corporativa Individual de 2 Fatores: PIN por E-mail + MFA TOTP no Celular
           </p>
 
           {/* Stepper indicator */}
           <div className="flex items-center justify-center gap-2 mt-4 text-[10px] font-mono">
-            <span className="px-2 py-0.5 rounded bg-blue-600 text-white font-bold">
-              1. Conta de App (@{ALLOWED_DOMAIN})
+            <span className={`px-2 py-0.5 rounded ${stage === 'email' ? 'bg-blue-600 text-white font-bold' : 'bg-slate-800 text-slate-400'}`}>
+              1. E-mail Institucional
+            </span>
+            <span className="text-slate-600">→</span>
+            <span className={`px-2 py-0.5 rounded ${stage === 'email_pin' ? 'bg-blue-600 text-white font-bold' : 'bg-slate-800 text-slate-400'}`}>
+              2. PIN no E-mail
             </span>
             <span className="text-slate-600">→</span>
             <span className="px-2 py-0.5 rounded bg-purple-600/30 text-purple-300 border border-purple-500/40">
-              2. MFA QR Code (No App.tsx)
+              3. MFA QR Code (App.tsx)
             </span>
             <span className="text-slate-600">→</span>
             <span className="px-2 py-0.5 rounded bg-slate-800 text-slate-400">
-              3. Cluster Liberado
+              4. Cluster Liberado
             </span>
           </div>
         </div>
 
-        {/* Method Toggle: Conta de Aplicativo vs Google OIDC */}
-        <div className="px-6 pt-4 flex gap-2 border-b border-slate-800/80 bg-slate-950/40">
-          <button
-            type="button"
-            onClick={() => {
-              sounds.playBlip(550);
-              setAuthMethod('app_account');
-              setAuthError(null);
-            }}
-            className={`pb-3 px-3 text-xs font-bold transition-all border-b-2 flex items-center gap-2 cursor-pointer ${
-              authMethod === 'app_account'
-                ? 'border-blue-500 text-blue-400'
-                : 'border-transparent text-slate-400 hover:text-slate-200'
-            }`}
-          >
-            <UserCheck className="w-4 h-4" />
-            <span>Conta de Aplicativo (Recomendado)</span>
-          </button>
-
-          <button
-            type="button"
-            onClick={() => {
-              sounds.playBlip(550);
-              setAuthMethod('google_oidc');
-              setAuthError(null);
-            }}
-            className={`pb-3 px-3 text-xs font-bold transition-all border-b-2 flex items-center gap-2 cursor-pointer ${
-              authMethod === 'google_oidc'
-                ? 'border-blue-500 text-blue-400'
-                : 'border-transparent text-slate-400 hover:text-slate-200'
-            }`}
-          >
-            <Globe className="w-4 h-4" />
-            <span>Google Workspace OIDC</span>
-          </button>
-        </div>
-
-        {/* Main Content */}
-        <div className="p-6 space-y-5">
-          {/* Security Policy Badge */}
-          <div className="p-3.5 rounded-xl bg-blue-950/40 border border-blue-800/60 flex items-start gap-3">
-            <ShieldCheck className="w-5 h-5 text-blue-400 shrink-0 mt-0.5" />
-            <div className="text-xs leading-relaxed">
-              <div className="font-bold text-white mb-0.5 flex items-center gap-2">
-                <span>Proteção Institucional Ativa</span>
-                <span className="text-[10px] font-mono bg-blue-950 text-blue-300 px-2 py-0.2 rounded border border-blue-700">
-                  DOMÍNIO: @{ALLOWED_DOMAIN}
-                </span>
-              </div>
-              <div className="text-slate-300">
-                Acesso estritamente restrito a contas da ION Sistemas. A autenticação pela Conta de Aplicativo libera diretamente a etapa de verificação de segundo fator MFA TOTP (QR Code) no aplicativo.
-              </div>
-            </div>
-          </div>
-
-          {authError && (
-            <div className="p-3 rounded-lg bg-red-950/80 border border-red-800 text-xs text-red-200">
-              {authError}
-            </div>
-          )}
-
-          {/* METHOD 1: CONTA DE APLICATIVO (APP ACCOUNT) */}
-          {authMethod === 'app_account' && (
-            <form onSubmit={handleAppAccountSubmit} className="space-y-4">
-              <div>
-                <label className="text-xs font-semibold text-slate-300 block mb-2">
-                  Selecione sua Conta Institucional ION Sistemas:
-                </label>
-                <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
-                  {PRECONFIGURED_APP_ACCOUNTS.map(account => (
-                    <button
-                      type="button"
-                      key={account.id}
-                      onClick={() => {
-                        sounds.playBlip(500);
-                        setSelectedAccountId(account.id);
-                      }}
-                      className={`p-2.5 rounded-xl border text-left transition-all cursor-pointer ${
-                        selectedAccountId === account.id
-                          ? 'bg-blue-950/80 border-blue-500 shadow-[0_0_15px_rgba(59,130,246,0.3)]'
-                          : 'bg-slate-950/60 border-slate-800 hover:border-slate-700'
-                      }`}
-                    >
-                      <div className="text-xs font-bold text-white flex items-center justify-between mb-0.5">
-                        <span className="truncate">{account.name}</span>
-                        {selectedAccountId === account.id && (
-                          <CheckCircle2 className="w-3.5 h-3.5 text-blue-400 shrink-0" />
-                        )}
-                      </div>
-                      <div className="text-[10px] font-mono text-blue-300 truncate">
-                        {account.email}
-                      </div>
-                      <div className="text-[10px] text-slate-400 mt-1 font-mono">
-                        {account.badge}
-                      </div>
-                    </button>
-                  ))}
-                </div>
-
-                {/* Option for custom @ionsistemas.com.br prefix */}
-                <div className="mt-2.5 pt-2 border-t border-slate-800/60 flex items-center gap-2">
-                  <button
-                    type="button"
-                    onClick={() => {
-                      sounds.playBlip(500);
-                      setSelectedAccountId('custom');
-                    }}
-                    className={`text-[11px] font-mono px-2.5 py-1 rounded-lg border transition-all cursor-pointer ${
-                      selectedAccountId === 'custom'
-                        ? 'bg-blue-900/60 border-blue-500 text-white'
-                        : 'bg-slate-900 border-slate-800 text-slate-400 hover:text-white'
-                    }`}
-                  >
-                    + Outro operador @{ALLOWED_DOMAIN}
-                  </button>
-
-                  {selectedAccountId === 'custom' && (
-                    <div className="flex-1 flex items-center bg-slate-950 border border-slate-800 rounded-lg px-2.5 py-1 text-xs font-mono">
-                      <input
-                        type="text"
-                        autoFocus
-                        value={customUserPrefix}
-                        onChange={e => setCustomUserPrefix(e.target.value)}
-                        placeholder="nome.sobrenome"
-                        className="bg-transparent text-white focus:outline-none w-full"
-                      />
-                      <span className="text-slate-500">@{ALLOWED_DOMAIN}</span>
-                    </div>
-                  )}
-                </div>
-              </div>
-
-              {/* App Key / Secret Input */}
-              <div>
-                <div className="flex items-center justify-between mb-1.5">
-                  <label className="text-xs font-semibold text-slate-300 flex items-center gap-1.5">
-                    <KeyRound className="w-3.5 h-3.5 text-amber-400" />
-                    <span>Segredo Corporativo / Chave da Conta de Aplicativo:</span>
-                  </label>
-                  <span className="text-[10px] font-mono text-emerald-400 bg-emerald-950/80 px-2 py-0.5 rounded border border-emerald-800 flex items-center gap-1">
-                    <ShieldCheck className="w-3 h-3 text-emerald-400" />
-                    <span>TLS 1.3 Criptografado</span>
+        {/* STAGE 1: COLLABORATOR ENTERS THEIR PERSONAL @ionsistemas.com.br EMAIL */}
+        {stage === 'email' && (
+          <div className="p-6 space-y-5">
+            {/* Domain Policy Notice */}
+            <div className="p-3.5 rounded-xl bg-blue-950/40 border border-blue-800/60 flex items-start gap-3">
+              <ShieldCheck className="w-5 h-5 text-blue-400 shrink-0 mt-0.5" />
+              <div className="text-xs leading-relaxed">
+                <div className="font-bold text-white mb-0.5 flex items-center gap-2">
+                  <span>Acesso Exclusivo a Colaboradores ION Sistemas</span>
+                  <span className="text-[10px] font-mono bg-blue-950 text-blue-300 px-2 py-0.2 rounded border border-blue-700">
+                    @{ALLOWED_DOMAIN}
                   </span>
                 </div>
+                <div className="text-slate-300">
+                  Cada colaborador deve autenticar com o seu próprio e-mail institucional. O código PIN de 6 dígitos será despachado de forma confidencial para a sua caixa de entrada corporativa.
+                </div>
+              </div>
+            </div>
 
+            {/* Quick collaborator presets */}
+            <div>
+              <label className="text-[11px] font-mono text-slate-400 block mb-1.5 uppercase tracking-wider">
+                Operadores em Plantão / Acesso Rápido:
+              </label>
+              <div className="grid grid-cols-2 gap-2">
+                <button
+                  type="button"
+                  onClick={() => {
+                    sounds.playBlip(500);
+                    setEmailInput('max.sena@ionsistemas.com.br');
+                    setNameInput('Max Sena');
+                  }}
+                  className={`p-2.5 rounded-xl border text-left transition-all cursor-pointer ${
+                    emailInput === 'max.sena@ionsistemas.com.br'
+                      ? 'bg-blue-950/80 border-blue-500 shadow-sm'
+                      : 'bg-slate-950/60 border-slate-800 hover:border-slate-700'
+                  }`}
+                >
+                  <div className="text-xs font-bold text-white flex items-center justify-between mb-0.5">
+                    <span>Max Sena</span>
+                    <span className="text-[9px] font-mono bg-blue-900 text-blue-300 px-1.5 py-0.2 rounded">
+                      Lead SRE
+                    </span>
+                  </div>
+                  <div className="text-[10px] font-mono text-slate-400 truncate">
+                    max.sena@{ALLOWED_DOMAIN}
+                  </div>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => {
+                    sounds.playBlip(500);
+                    setEmailInput('sre.operator@ionsistemas.com.br');
+                    setNameInput('Operador SRE');
+                  }}
+                  className={`p-2.5 rounded-xl border text-left transition-all cursor-pointer ${
+                    emailInput === 'sre.operator@ionsistemas.com.br'
+                      ? 'bg-blue-950/80 border-blue-500 shadow-sm'
+                      : 'bg-slate-950/60 border-slate-800 hover:border-slate-700'
+                  }`}
+                >
+                  <div className="text-xs font-bold text-white flex items-center justify-between mb-0.5">
+                    <span>Operador SRE</span>
+                    <span className="text-[9px] font-mono bg-purple-900 text-purple-300 px-1.5 py-0.2 rounded">
+                      On-Call
+                    </span>
+                  </div>
+                  <div className="text-[10px] font-mono text-slate-400 truncate">
+                    sre.operator@{ALLOWED_DOMAIN}
+                  </div>
+                </button>
+              </div>
+            </div>
+
+            {/* Form for any collaborator */}
+            <form onSubmit={handleSendPin} className="space-y-4 pt-1">
+              <div>
+                <label className="text-xs font-semibold text-slate-300 block mb-1">
+                  Seu E-mail Institucional (@{ALLOWED_DOMAIN}):
+                </label>
                 <div className="relative">
                   <input
-                    type={showSecret ? 'text' : 'password'}
+                    type="email"
                     required
-                    value={appKeyInput}
-                    onChange={e => setAppKeyInput(e.target.value)}
-                    placeholder="Insira o segredo da conta services@ionsistemas.com.br"
-                    className="w-full pl-3.5 pr-10 py-2.5 bg-slate-950 border border-slate-800 rounded-xl text-xs font-mono text-slate-100 placeholder-slate-600 focus:outline-none focus:border-blue-500 tracking-wider"
+                    value={emailInput}
+                    onChange={e => setEmailInput(e.target.value)}
+                    placeholder={`seu.nome@${ALLOWED_DOMAIN}`}
+                    className="w-full pl-3.5 pr-10 py-2.5 bg-slate-950 border border-slate-800 rounded-xl text-xs font-mono text-slate-100 placeholder-slate-600 focus:outline-none focus:border-blue-500"
                   />
-                  <button
-                    type="button"
-                    onClick={() => setShowSecret(!showSecret)}
-                    className="absolute right-3 top-2.5 text-slate-400 hover:text-white transition-colors cursor-pointer"
-                    title={showSecret ? 'Ocultar segredo' : 'Exibir segredo'}
-                  >
-                    {showSecret ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
-                  </button>
+                  <Mail className="w-4 h-4 text-slate-500 absolute right-3.5 top-3 pointer-events-none" />
                 </div>
+              </div>
 
-                <div className="p-3 rounded-xl bg-blue-950/40 border border-blue-800/60 mt-2 text-[11px] text-slate-300 space-y-1.5">
-                  <div className="flex items-center justify-between font-mono text-[10px] text-blue-300 pb-1 border-b border-blue-900/40">
-                    <span className="flex items-center gap-1.5 font-bold">
-                      <Lock className="w-3.5 h-3.5 text-blue-400" />
-                      Modelo 1: Google Cloud Secret Manager (GCP)
-                    </span>
-                    <span className="text-emerald-400 bg-emerald-950 px-2 py-0.5 rounded border border-emerald-800 font-bold">
-                      KMS AES-256 ATIVO
-                    </span>
-                  </div>
-
-                  <div className="text-xs text-slate-200">
-                    <strong>Local de Armazenamento Oficial:</strong> O segredo da conta <code className="text-emerald-400 font-mono">services@ionsistemas.com.br</code> é mantido no cofre <strong>Google Cloud Secret Manager</strong> sob <code className="text-blue-300 font-mono">projects/[PROJECT_ID]/secrets/services-app-secret</code>.
-                  </div>
-
-                  <div className="text-[10px] text-slate-400 font-mono flex flex-wrap gap-x-4 gap-y-1 pt-0.5">
-                    <span>• Criptografia: Google Cloud KMS</span>
-                    <span>• Replicação: Automática (Multi-Region)</span>
-                    <span>• Auditoria: Cloud Audit Logs</span>
-                  </div>
-                </div>
+              <div>
+                <label className="text-xs font-semibold text-slate-300 block mb-1">
+                  Nome do Colaborador / Ionizador:
+                </label>
+                <input
+                  type="text"
+                  required
+                  value={nameInput}
+                  onChange={e => setNameInput(e.target.value)}
+                  placeholder="Seu Nome e Sobrenome"
+                  className="w-full px-3.5 py-2.5 bg-slate-950 border border-slate-800 rounded-xl text-xs text-slate-100 placeholder-slate-600 focus:outline-none focus:border-blue-500"
+                />
               </div>
 
               {/* Guild & Team Selection */}
@@ -631,7 +409,7 @@ export const CorporateAuthGate: React.FC<CorporateAuthGateProps> = ({
                 {/* Combat Team Selection */}
                 <div>
                   <label className="text-xs font-semibold text-slate-300 block mb-1.5">
-                    Papel de Batalha:
+                    Seu Papel de Combate na Arena:
                   </label>
                   <div className="grid grid-cols-2 gap-2">
                     <button
@@ -682,74 +460,183 @@ export const CorporateAuthGate: React.FC<CorporateAuthGateProps> = ({
               {/* Submit Button */}
               <button
                 type="submit"
-                disabled={isAuthenticating}
-                className="w-full py-3 rounded-xl bg-gradient-to-r from-blue-600 via-indigo-600 to-blue-700 hover:from-blue-500 hover:to-indigo-500 text-white font-bold text-xs flex items-center justify-center gap-2 cursor-pointer shadow-lg transition-all disabled:opacity-50"
+                disabled={!emailInput.trim() || isSendingPin}
+                className="w-full py-3 rounded-xl bg-gradient-to-r from-blue-600 via-indigo-600 to-blue-700 hover:from-blue-500 hover:to-indigo-500 disabled:bg-slate-800 disabled:text-slate-500 disabled:cursor-not-allowed text-white font-bold text-xs flex items-center justify-center gap-2 cursor-pointer shadow-lg transition-all"
               >
-                {isAuthenticating ? (
+                {isSendingPin ? (
                   <>
                     <RefreshCw className="w-4 h-4 animate-spin" />
-                    <span>Autenticando Conta de Aplicativo...</span>
+                    <span>Despachando PIN de Segurança...</span>
                   </>
                 ) : (
                   <>
-                    <Fingerprint className="w-4 h-4" />
-                    <span>Autenticar Conta e Abrir Verificação MFA</span>
+                    <Mail className="w-4 h-4" />
+                    <span>Enviar PIN para meu E-mail Corporativo</span>
                     <ArrowRight className="w-4 h-4" />
                   </>
                 )}
               </button>
             </form>
-          )}
 
-          {/* METHOD 2: GOOGLE WORKSPACE OIDC */}
-          {authMethod === 'google_oidc' && (
-            <div className="p-5 rounded-2xl bg-gradient-to-b from-slate-900 to-slate-950 border border-slate-800 text-center space-y-4">
-              <div className="text-xs font-semibold text-slate-200">
-                Google Workspace Identity Services (OIDC)
+            {/* Domain defense test simulation */}
+            <div className="pt-1 flex items-center justify-between text-[11px] text-slate-500 font-mono px-1">
+              <span>Auditoria de Domínio:</span>
+              <button
+                type="button"
+                onClick={handleSimulateBlockedDomain}
+                className="text-slate-500 hover:text-amber-400 underline cursor-pointer"
+                title="Testar barreira de segurança tentando login com conta externa @gmail.com"
+              >
+                Simular rejeição (@gmail.com)
+              </button>
+            </div>
+          </div>
+        )}
+
+        {/* STAGE 2: VALIDATE 6-DIGIT EMAIL PIN (CONFIDENTIAL) */}
+        {stage === 'email_pin' && (
+          <div className="p-6 space-y-5">
+            <div className="p-4 rounded-xl bg-blue-950/40 border border-blue-800/60 flex items-start gap-3">
+              <Mail className="w-5 h-5 text-blue-400 shrink-0 mt-0.5" />
+              <div className="text-xs leading-relaxed">
+                <div className="font-bold text-white mb-1">
+                  Camada 1: PIN Confidencial Enviado por E-mail
+                </div>
+                <div className="text-slate-300">
+                  Um código PIN de 6 dígitos foi enviado para <strong className="text-emerald-400 font-mono">{emailInput}</strong>.
+                </div>
+                <div className="text-slate-400 text-[11px] mt-1">
+                  Por segurança corporativa, acesse a sua caixa de entrada no webmail da ION Sistemas para visualizá-lo.
+                </div>
               </div>
-              <p className="text-xs text-slate-400 max-w-sm mx-auto">
-                O OIDC direto requer um OAuth 2.0 Client ID provisionado no Google Cloud Console com as origens de Cloud Run autorizadas.
+            </div>
+
+            {/* Direct Webmail Corporate Inbox Access Box */}
+            <div className="p-3.5 rounded-xl bg-gradient-to-r from-blue-950/80 via-indigo-950/60 to-slate-900 border border-blue-500/50 shadow-md space-y-2">
+              <div className="flex items-center justify-between">
+                <span className="text-[11px] font-bold text-blue-200 flex items-center gap-1.5">
+                  <Mail className="w-4 h-4 text-blue-400" />
+                  Webmail Corporativo ION Sistemas
+                </span>
+                <span className="text-[10px] font-mono text-emerald-400 bg-emerald-950/80 border border-emerald-800 px-2 py-0.5 rounded">
+                  Inbox Conectado
+                </span>
+              </div>
+              <p className="text-[11px] text-slate-300 leading-relaxed">
+                Caso o seu aplicativo de e-mail corporativo tenha demora de entrega ou filtros de spam, abra a caixa de entrada oficial abaixo para visualizar o e-mail recebido e preencher automaticamente.
               </p>
+              <button
+                type="button"
+                onClick={() => {
+                  sounds.playBlip(600);
+                  setIsWebmailOpen(true);
+                }}
+                className="w-full py-2.5 px-3 rounded-lg bg-blue-600 hover:bg-blue-500 text-white font-bold text-xs flex items-center justify-center gap-2 cursor-pointer shadow-md transition-all"
+              >
+                <Mail className="w-4 h-4" />
+                <span>📬 Abrir Caixa de Entrada (Ver E-mail com PIN)</span>
+              </button>
+            </div>
 
-              <div className="flex flex-col items-center justify-center min-h-[44px]">
-                <div ref={googleBtnContainerRef} className="flex justify-center" />
+            {pinError && (
+              <div className="p-3 rounded-lg bg-red-950/80 border border-red-800 text-xs text-red-200">
+                {pinError}
+              </div>
+            )}
+
+            <form onSubmit={handleVerifyPin} className="space-y-4">
+              <div>
+                <label className="text-xs font-semibold text-slate-300 block mb-1">
+                  Digite o PIN de 6 dígitos recebido no seu e-mail:
+                </label>
+                <input
+                  type="text"
+                  maxLength={6}
+                  required
+                  autoFocus
+                  value={submittedPin}
+                  onChange={e => setSubmittedPin(e.target.value.replace(/\D/g, ''))}
+                  placeholder="______"
+                  className="w-full text-center tracking-widest px-3.5 py-3 bg-slate-950 border border-slate-800 rounded-xl text-xl font-mono text-white focus:outline-none focus:border-blue-500 placeholder-slate-700"
+                />
               </div>
 
-              <div className="pt-2 border-t border-slate-800/80 space-y-2">
+              <div className="flex items-center justify-between text-xs text-slate-400">
+                <span className="flex items-center gap-1 font-mono text-[11px]">
+                  <Clock className="w-3.5 h-3.5 text-slate-500" />
+                  <span>Válido por 10 minutos</span>
+                </span>
+
+                <button
+                  type="button"
+                  disabled={pinCooldown > 0 || isSendingPin}
+                  onClick={async () => {
+                    setIsSendingPin(true);
+                    try {
+                      await dispatchEmailPin(emailInput);
+                      setPinCooldown(60);
+                      sounds.playBlip();
+                    } finally {
+                      setIsSendingPin(false);
+                    }
+                  }}
+                  className="text-blue-400 hover:text-blue-300 disabled:text-slate-600 disabled:cursor-not-allowed font-semibold text-[11px] underline flex items-center gap-1"
+                >
+                  {isSendingPin && <RefreshCw className="w-3 h-3 animate-spin" />}
+                  <span>{pinCooldown > 0 ? `Reenviar em ${pinCooldown}s` : 'Reenviar PIN para o e-mail'}</span>
+                </button>
+              </div>
+
+              <div className="flex gap-2 pt-2">
                 <button
                   type="button"
                   onClick={() => {
-                    setAuthMethod('app_account');
-                    sounds.playBlip(600);
+                    sounds.playBlip();
+                    setStage('email');
                   }}
-                  className="w-full py-2.5 px-3 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-semibold flex items-center justify-center gap-2 cursor-pointer transition-colors"
+                  className="w-1/3 py-2.5 rounded-xl bg-slate-900 hover:bg-slate-800 text-slate-300 text-xs font-semibold transition-colors cursor-pointer"
                 >
-                  <UserCheck className="w-4 h-4 text-blue-400" />
-                  <span>Usar Conta de Aplicativo da ION Sistemas (Acesso Direto)</span>
+                  Voltar
+                </button>
+
+                <button
+                  type="submit"
+                  disabled={submittedPin.length < 6 || isVerifyingPin}
+                  className="w-2/3 py-2.5 rounded-xl bg-blue-600 hover:bg-blue-500 disabled:bg-slate-800 disabled:text-slate-500 disabled:cursor-not-allowed text-white font-semibold text-xs transition-colors flex items-center justify-center gap-2 cursor-pointer shadow-md"
+                >
+                  {isVerifyingPin ? (
+                    <>
+                      <RefreshCw className="w-4 h-4 animate-spin" />
+                      <span>Validando PIN...</span>
+                    </>
+                  ) : (
+                    <>
+                      <span>Validar PIN e Ir para MFA</span>
+                      <ArrowRight className="w-4 h-4" />
+                    </>
+                  )}
                 </button>
               </div>
-            </div>
-          )}
-
-          {/* Security Wall Verification Test (Verify Domain Defense) */}
-          <div className="pt-1 flex items-center justify-between text-[11px] text-slate-500 font-mono px-1">
-            <span>Auditoria de Domínio:</span>
-            <button
-              type="button"
-              onClick={handleSimulateBlockedDomain}
-              className="text-slate-500 hover:text-amber-400 underline cursor-pointer"
-              title="Testar barreira de segurança tentando login com conta não autorizada"
-            >
-              Simular rejeição (@gmail.com)
-            </button>
+            </form>
           </div>
-        </div>
+        )}
 
         {/* Footer */}
         <div className="p-4 bg-slate-950 border-t border-slate-800/80 text-center text-[11px] text-slate-500 font-mono">
-          Portal ION Sistemas Telecom · Acesso Restrito @{ALLOWED_DOMAIN} · Camada 2 MFA Obrigatória
+          Portal do Colaborador · Domínio Restrito @{ALLOWED_DOMAIN} · Camada 2 MFA Obrigatória no App.tsx
         </div>
       </div>
+
+      {/* CORPORATE WEBMAIL INBOX VIEWER MODAL */}
+      <CorporateWebmailModal
+        isOpen={isWebmailOpen}
+        email={emailInput}
+        onClose={() => setIsWebmailOpen(false)}
+        onApplyPin={(pin) => {
+          setSubmittedPin(pin);
+          setPinError(null);
+        }}
+      />
     </div>
   );
 };
