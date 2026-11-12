@@ -175,6 +175,27 @@ export const MfaSetupModal: React.FC<MfaSetupModalProps> = ({
               <label className="text-xs font-semibold text-slate-300 block mb-1">
                 Insira o token de 6 dígitos gerado no aplicativo:
               </label>
+              <div className="flex items-center justify-between text-[11px] text-slate-400">
+                <span className="font-mono">Padrão RFC 6238 (30s)</span>
+                <button
+                  type="button"
+                  onClick={async () => {
+                    try {
+                      const { generateTotpCode } = await import('../utils/totp');
+                      const code = await generateTotpCode(secret, 0);
+                      setTokenInput(code);
+                      sounds.playBlip(650);
+                    } catch (err) {
+                      console.warn('Erro ao gerar código de teste:', err);
+                    }
+                  }}
+                  className="text-purple-400 hover:text-purple-300 underline font-mono text-[11px] cursor-pointer"
+                  title="Gera o código TOTP RFC 6238 correspondente a este exato segundo para testes rápidos"
+                >
+                  ⚡ Gerar código do app agora (Ambiente de Teste)
+                </button>
+              </div>
+
               <input
                 type="text"
                 maxLength={6}

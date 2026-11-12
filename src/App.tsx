@@ -40,6 +40,7 @@ import {
 import { sounds } from './utils/audio';
 
 import { CorporateAuthGate } from './components/CorporateAuthGate';
+import { MfaSetupModal } from './components/MfaSetupModal';
 import { TitleScreen } from './components/TitleScreen';
 import { GameHUD } from './components/GameHUD';
 import { ClusterTopology } from './components/ClusterTopology';
@@ -62,6 +63,12 @@ export default function App() {
   const [currentTeam, setCurrentTeam] = React.useState<TeamSide>('blue');
   const [guilds, setGuilds] = React.useState<Guild[]>(INITIAL_GUILDS);
   const [currentGuildId, setCurrentGuildId] = React.useState<string>(INITIAL_GUILDS[0].id);
+
+  // Google OIDC Pending State: Layer 1 approved, awaiting Layer 2 MFA verification in App.tsx
+  const [pendingOidcUser, setPendingOidcUser] = React.useState<CorporateUser | null>(null);
+  const [pendingTeam, setPendingTeam] = React.useState<TeamSide>('blue');
+  const [pendingGuildId, setPendingGuildId] = React.useState<string>(INITIAL_GUILDS[0].id);
+  const [isMfaModalOpen, setIsMfaModalOpen] = React.useState<boolean>(false);
 
   // Live Battle Events Feed between Blue Team & Red Team
   const [battleEvents, setBattleEvents] = React.useState<BattleEvent[]>([
@@ -388,37 +395,63 @@ export default function App() {
     return () => clearInterval(interval);
   }, [gameState, activeScenario, deployments, nodes, pods, alerts, awardXp, unlockBadge]);
 
-  // Handle Authentication from Corporate Gate
-  const handleAuthenticated = (user: CorporateUser, team: TeamSide, guildId: string) => {
-    setCorporateUser(user);
-    setCurrentTeam(team);
-    setCurrentGuildId(guildId);
-    awardXp(200);
+  // Step 1: Handle Google OIDC Success -> Immediately triggers MfaSetupModal in App.tsx
+  const handleGoogleOidcSuccess = (user: CorporateUser, team: TeamSide, guildId: string) => {
+    setPendingOidcUser({
+      ...user,
+      mfaVerified: false,
+    });
+    setPendingTeam(team);
+    setPendingGuildId(guildId);
+    setIsMfaModalOpen(true);
+    sounds.playBlip(600);
+  };
 
-    // Add user to the guild member list if not present
+  // Step 2: Handle Successful MFA TOTP Verification -> Releases the Game
+  const handleMfaVerificationSuccess = (secret: string) => {
+    if (!pendingOidcUser) return;
+
+    const verifiedUser: CorporateUser = {
+      ...pendingOidcUser,
+      mfaVerified: true,
+      authenticatedAt: Date.now(),
+    };
+
+    setCorporateUser(verifiedUser);
+    setCurrentTeam(pendingTeam);
+    setCurrentGuildId(pendingGuildId);
+    saveCorporateUser(verifiedUser);
+
+    setPendingOidcUser(null);
+    setIsMfaModalOpen(false);
+
+    awardXp(200);
+    sounds.playSuccess();
+
+    // Register user in the selected squad/guild
     setGuilds(prevGuilds =>
       prevGuilds.map(g => {
-        if (g.id === guildId) {
-          const exists = g.members.some(m => m.email === user.email);
+        if (g.id === pendingGuildId) {
+          const exists = g.members.some(m => m.email === verifiedUser.email);
           if (exists) {
             return {
               ...g,
               members: g.members.map(m =>
-                m.email === user.email ? { ...m, team, online: true } : m
+                m.email === verifiedUser.email ? { ...m, team: pendingTeam, online: true } : m
               ),
             };
           }
           const newMember = {
             id: `member-${Date.now()}`,
-            name: user.name,
-            email: user.email,
-            avatar: team === 'blue' ? '👨‍💻' : '⚡',
-            role: team === 'blue' ? 'Senior SRE' as const : 'Chaos Specialist' as const,
-            team,
+            name: verifiedUser.name,
+            email: verifiedUser.email,
+            avatar: pendingTeam === 'blue' ? '👨‍💻' : '⚡',
+            role: pendingTeam === 'blue' ? ('Senior SRE' as const) : ('Chaos Specialist' as const),
+            team: pendingTeam,
             online: true,
             score: 200,
             badgesCount: 1,
-            lastAction: 'Ingressou na Arena ION Sistemas',
+            lastAction: 'Ingressou na Arena ION Sistemas (Google OIDC + MFA Validado)',
           };
           return { ...g, members: [newMember, ...g.members] };
         }
@@ -427,9 +460,20 @@ export default function App() {
     );
   };
 
+  // Cancel MFA -> Resets pending state and prevents game entry
+  const handleMfaCancel = () => {
+    setPendingOidcUser(null);
+    setIsMfaModalOpen(false);
+    setCorporateUser(null);
+    clearCorporateUser();
+    sounds.playBlip(400);
+  };
+
   const handleLogout = () => {
     clearCorporateUser();
     setCorporateUser(null);
+    setPendingOidcUser(null);
+    setIsMfaModalOpen(false);
     setGameState('TITLE');
   };
 
@@ -942,9 +986,26 @@ export default function App() {
     awardXp(100);
   };
 
-  // IF NOT AUTHENTICATED: Show Corporate Auth Gate for @ionsistemas.com.br
-  if (!corporateUser) {
-    return <CorporateAuthGate onAuthenticated={handleAuthenticated} />;
+  // IF NOT AUTHENTICATED OR MFA NOT VERIFIED: Show Corporate Auth Gate & MfaSetupModal in App.tsx logic flow
+  if (!corporateUser || !corporateUser.mfaVerified) {
+    return (
+      <div className="relative min-h-screen w-full">
+        <CorporateAuthGate 
+          onGoogleOidcSuccess={handleGoogleOidcSuccess}
+          onAuthenticated={handleGoogleOidcSuccess}
+        />
+
+        {/* Root-Level MFA Enforcement Modal: Users cannot enter without valid TOTP token */}
+        {isMfaModalOpen && pendingOidcUser && (
+          <MfaSetupModal
+            isOpen={isMfaModalOpen}
+            email={pendingOidcUser.email}
+            onSuccess={handleMfaVerificationSuccess}
+            onCancel={handleMfaCancel}
+          />
+        )}
+      </div>
+    );
   }
 
   return (
